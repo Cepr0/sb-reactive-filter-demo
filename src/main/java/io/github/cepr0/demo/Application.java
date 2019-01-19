@@ -6,32 +6,31 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
 import org.springframework.data.mongodb.repository.config.EnableReactiveMongoRepositories;
 import org.springframework.http.server.reactive.ServerHttpRequest;
-import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ServerWebExchange;
 import org.springframework.web.server.WebFilter;
+import org.springframework.web.server.WebFilterChain;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
 @Slf4j
-@EnableAsync
 @RestController
 @EnableReactiveMongoRepositories
 @SpringBootApplication
 public class Application {
 
 	private final UserRepo userRepo;
-	private final UserService userService;
+	private final PageViewRepo pageViewRepo;
 
-	public Application(UserRepo userRepo, UserService userService) {
+	public Application(UserRepo userRepo, final PageViewRepo pageViewRepo) {
 		this.userRepo = userRepo;
-		this.userService = userService;
+		this.pageViewRepo = pageViewRepo;
 	}
 
 	public static void main(String[] args) {
@@ -39,14 +38,16 @@ public class Application {
 	}
 
 	@GetMapping("/")
-	public Mono<?> get(@RequestHeader("token") String token, ServerWebExchange exchange) {
-		Object tokenAttribute = exchange.getAttributes().get("_token");
-		return Mono.just(Map.of("token", token, "_token", tokenAttribute != null ? tokenAttribute : ""));
+	public Mono<?> get(ServerWebExchange exchange) {
+		Object token = exchange.getAttributes().get("_token");
+		log.info("[i] Controller: handling 'root' request. Token attribute is '{}'", token);
+		return Mono.just(Map.of("_token", token != null ? token : "null"));
 	}
 
 	@GetMapping("/users")
-	public Flux<?> getAllUsers() {
-		log.info("[i] Get all users...");
+	public Flux<?> getAllUsers(ServerWebExchange exchange) {
+		Object token = exchange.getAttribute("_token");
+		log.info("[i] Controller: handling 'get all users' request. Token attribute is '{}'", token);
 		return userRepo.findAll();
 	}
 
@@ -55,30 +56,44 @@ public class Application {
 		return (exchange, chain) -> {
 			ServerHttpRequest req = exchange.getRequest();
 			String uri = req.getURI().toString();
-			log.info("[i] Got request: {}", uri);
+			log.info("[i] Web Filter: received the request: {}", uri);
 
 			var headers = req.getHeaders();
 			List<String> tokenList = headers.get("token");
 
 			if (tokenList != null && tokenList.get(0) != null) {
 				String token = tokenList.get(0);
-				log.info("[i] Find a user by token {}", token);
-				return userRepo.findByToken(token)
-						.map(user -> process(exchange, uri, token, user))
-						.then(chain.filter(exchange));
+				Mono<User> foundUser = userRepo
+						.findByToken(token)
+						.doOnNext(user -> log.info("[i] Web Filter: {} has been found", user));
+				return updateUserStat(foundUser, exchange, chain, uri);
 			} else {
 				String token = UUID.randomUUID().toString();
-				log.info("[i] Create a new user with token {}", token);
-				return userRepo.save(new User(token))
-						.map(user -> process(exchange, uri, token, user))
-						.then(chain.filter(exchange));
+				Mono<User> createdUser = userRepo
+						.save(new User(token))
+						.doOnNext(user -> log.info("[i] Web Filter: a new {} has been created", user));
+				return updateUserStat(createdUser, exchange, chain, uri);
 			}
 		};
 	}
 
-	private User process(ServerWebExchange exchange, String uri, String token, User user) {
-		exchange.getAttributes().put("_token", token);
-		userService.updateUserStat(uri, user); // async call
-		return user;
+	private Mono<Void> updateUserStat(Mono<User> userMono, ServerWebExchange exchange, WebFilterChain chain, String uri) {
+		return userMono
+				.doOnNext(user -> exchange.getAttributes().put("_token", user.getToken()))
+				.doOnNext(u -> {
+					String token = exchange.getAttribute("_token");
+					log.info("[i] Web Filter: token attribute has been set to '{}'", token);
+				})
+				.delayElement(Duration.ofSeconds(1)) // emulates a delay while updating the user
+				.flatMap(user -> pageViewRepo.save(new PageView(uri)).flatMap(user::addPageView).flatMap(userRepo::save))
+				.doOnNext(user -> {
+					int numberOfPages = 0;
+					List<PageView> pageViews = user.getPageViews();
+					if (pageViews != null) {
+						numberOfPages = pageViews.size();
+					}
+					log.info("[i] Web Filter: {} has been updated. Number of pages: {}", user, numberOfPages);
+				})
+				.then(chain.filter(exchange));
 	}
 }
